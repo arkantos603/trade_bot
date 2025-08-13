@@ -1,0 +1,8 @@
+pandas
+numpy
+yfinance
+plotly
+streamlit
+scikit-learn
+gymnasium
+stable-baselines3
