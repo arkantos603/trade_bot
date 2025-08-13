@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+
 from src.data import load_ohlc_safe, add_returns
 from src.sim_rule import StrategyConfig, simulate_rule
 
@@ -14,7 +15,7 @@ def _fmt_datetime_pt(ts) -> str:
 def _build_trades_df(df_price: pd.DataFrame, res: dict, base_currency="USD") -> pd.DataFrame:
     """
     Retorna um DataFrame com duas linhas por trade (Entrada e Saída),
-    colunas em USD e %, e **banca total** após cada trade (últimas colunas).
+    colunas em USD e %, e banca total após cada trade (últimas colunas).
     """
     trades = res.get("trades", pd.DataFrame()).copy()
     if trades is None or len(trades) == 0:
@@ -116,7 +117,7 @@ def _build_trades_df(df_price: pd.DataFrame, res: dict, base_currency="USD") -> 
         "Trade #","Viés","Tipo","Data/Tempo","Sinal","Preço (USD)","Qty","Notional (USD)",
         "P&L (USD)","P&L (%)","Run-up (USD)","Run-up (%)","Drawdown (USD)","Drawdown (%)",
         "L&P acumulado (USD)","L&P acumulado (%)",
-        "Banca total (USD)","Banca total (%)"   # << últimas colunas
+        "Banca total (USD)","Banca total (%)"
     ]
     return out[col_order]
 
@@ -162,6 +163,138 @@ def _performance_table(df_price: pd.DataFrame, res: dict) -> pd.DataFrame:
         "Máx. de contratos detidos": [f"{max_qty_held:,.0f}", f"{max_qty_held:,.0f}", "0"],
     }
     return pd.DataFrame.from_dict(linhas, orient="index", columns=["Todos", "Viés de alta", "Viés de baixa"])
+
+# ========= Análise de negociações =========
+def _fmt_usd_only(x: float) -> str:
+    return f"{x:,.2f} USD".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def _fmt_pct_only(p: float) -> str:
+    return f"{p*100:.2f}%".replace(".", ",")
+
+def _cell_usd_pct(usd: float, pct: float) -> str:
+    # duas linhas: USD na primeira, % na segunda
+    return _fmt_usd_only(usd) + "\n" + _fmt_pct_only(pct)
+
+def _trades_analysis_table(df_price: pd.DataFrame, res: dict) -> pd.DataFrame:
+    """Tabela estilo 'Análise de negociações' (Todos / Viés de alta / Viés de baixa)."""
+    import numpy as np
+
+    trades = res.get("trades", pd.DataFrame()).copy()
+    if trades is None or len(trades) == 0:
+        return pd.DataFrame({"Todos": []})
+
+    trades["entry_price"] = trades["entry_price"].astype(float)
+    trades["exit_price"] = trades["exit_price"].astype(float)
+    trades["qty"] = trades["qty"].astype(float)
+    trades["pnl_cash"] = trades["pnl_cash"].astype(float)
+    trades["notional"] = trades["entry_price"] * trades["qty"]
+    trades["pnl_pct"] = trades["pnl_cash"] / trades["notional"].replace({0: np.nan})
+    trades["closed"] = trades["exit_time"].notna()
+
+    def _bars(row):
+        try:
+            win = df_price.loc[row["entry_time"]:row["exit_time"]]
+        except Exception:
+            win = df_price[(df_price.index >= row["entry_time"]) & (df_price.index <= row["exit_time"])]
+        return int(len(win))
+    trades["n_bars"] = trades.apply(_bars, axis=1)
+
+    def _stats(df_sub: pd.DataFrame) -> dict:
+        s = {}
+        total = len(df_sub)
+        open_trades = int((~df_sub["closed"]).sum())
+        closed = df_sub[df_sub["closed"]]
+
+        s["Total de negociações"] = total
+        s["Total de negociações em aberto"] = open_trades
+
+        if len(closed) == 0:
+            for k in [
+                "Negociações com Lucro", "Negociações com prejuízo", "Porcentagem rentável",
+                "Média L&P", "Media de transações com lucro", "Média de transações com prejuízo",
+                "Razão lucro médio / prejuízo médio", "Negociação com maior lucro",
+                "Negociação com maior lucro em porcentagem", "Negociação com maior prejuízo",
+                "Negociação com maior prejuízo em porcentagem",
+                "Número médio de # barras em transações",
+                "Número médio de barras em transações com lucro",
+                "Número médio de # barras em transações com prejuízo",
+            ]:
+                s[k] = "ø"
+            return s
+
+        wins = closed[closed["pnl_cash"] > 0]
+        losses = closed[closed["pnl_cash"] < 0]
+        s["Negociações com Lucro"] = int(len(wins))
+        s["Negociações com prejuízo"] = int(len(losses))
+        win_rate = len(wins) / len(closed) if len(closed) else 0.0
+        s["Porcentagem rentável"] = _fmt_pct_only(win_rate)
+
+        mean_pnl_cash = float(closed["pnl_cash"].mean())
+        mean_pnl_pct = float(closed["pnl_pct"].mean())
+        s["Média L&P"] = _cell_usd_pct(mean_pnl_cash, mean_pnl_pct)
+
+        mean_win_cash = float(wins["pnl_cash"].mean()) if len(wins) else 0.0
+        mean_win_pct = float(wins["pnl_pct"].mean()) if len(wins) else 0.0
+        s["Media de transações com lucro"] = _cell_usd_pct(mean_win_cash, mean_win_pct)
+
+        mean_loss_cash = float(losses["pnl_cash"].mean()) if len(losses) else 0.0
+        mean_loss_pct = float(losses["pnl_pct"].mean()) if len(losses) else 0.0
+        s["Média de transações com prejuízo"] = _cell_usd_pct(mean_loss_cash, mean_loss_pct)
+
+        if mean_loss_cash == 0:
+            ratio = float("inf") if mean_win_cash > 0 else 0.0
+        else:
+            ratio = abs(mean_win_cash) / abs(mean_loss_cash)
+        s["Razão lucro médio / prejuízo médio"] = "∞" if ratio == float("inf") else f"{ratio:.3f}".replace(".", ",")
+
+        idx_max = closed["pnl_cash"].idxmax()
+        idx_min = closed["pnl_cash"].idxmin()
+        s["Negociação com maior lucro"] = _fmt_usd_only(float(closed.loc[idx_max, "pnl_cash"]))
+        s["Negociação com maior lucro em porcentagem"] = _fmt_pct_only(float(closed.loc[idx_max, "pnl_pct"]))
+        s["Negociação com maior prejuízo"] = _fmt_usd_only(float(closed.loc[idx_min, "pnl_cash"]))
+        s["Negociação com maior prejuízo em porcentagem"] = _fmt_pct_only(float(closed.loc[idx_min, "pnl_pct"]))
+
+        s["Número médio de # barras em transações"] = f"{float(closed['n_bars'].mean()):.0f}".replace(".", ",")
+        s["Número médio de barras em transações com lucro"] = (
+            f"{float(wins['n_bars'].mean()):.0f}".replace(".", ",") if len(wins) else "ø"
+        )
+        s["Número médio de # barras em transações com prejuízo"] = (
+            f"{float(losses['n_bars'].mean()):.0f}".replace(".", ",") if len(losses) else "ø"
+        )
+        return s
+
+    stats_all = _stats(trades)
+    stats_long = _stats(trades)
+
+    def _to_low_bias(v):
+        return "ø" if isinstance(v, str) else 0
+
+    ordered_keys = [
+        "Total de negociações",
+        "Total de negociações em aberto",
+        "Negociações com Lucro",
+        "Negociações com prejuízo",
+        "Porcentagem rentável",
+        "Média L&P",
+        "Media de transações com lucro",
+        "Média de transações com prejuízo",
+        "Razão lucro médio / prejuízo médio",
+        "Negociação com maior lucro",
+        "Negociação com maior lucro em porcentagem",
+        "Negociação com maior prejuízo",
+        "Negociação com maior prejuízo em porcentagem",
+        "Número médio de # barras em transações",
+        "Número médio de barras em transações com lucro",
+        "Número médio de # barras em transações com prejuízo",
+    ]
+
+    df_out = pd.DataFrame({
+        "Todos": [stats_all[k] for k in ordered_keys],
+        "Viés de alta": [stats_long[k] for k in ordered_keys],
+        "Viés de baixa": [_to_low_bias(stats_all[k]) for k in ordered_keys],
+    }, index=ordered_keys)
+
+    return df_out
 
 # -------- Cache (30 min) --------
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -303,21 +436,7 @@ if st.button("Rodar Simulação"):
         # Simulação no intervalo da estratégia
         res = simulate_rule(df, float(bank), cfg)
 
-        # ----- Saídas -----
-        st.subheader("Métricas")
-        st.json(res["stats"])
-
-        st.subheader("Desempenho")
-        perf_df = _performance_table(df, res)
-        st.dataframe(perf_df, use_container_width=True)
-
-        st.subheader("Equity Curve")
-        eq = res["equity"]
-        fig_eq = go.Figure()
-        fig_eq.add_trace(go.Scatter(x=eq.index, y=eq.values, mode="lines", name="Equity"))
-        st.plotly_chart(fig_eq, use_container_width=True)
-
-        # Dados para GRÁFICO (visualização), sem afetar simulação
+        # ===== Preço + Sinais =====
         try:
             df_vis = _fetch_prices(ticker, str(start), str(end), chart_interval)
         except Exception:
@@ -350,13 +469,25 @@ if st.button("Rodar Simulação"):
                 )
         st.plotly_chart(fig, use_container_width=True)
 
-        # -------- Trades (detalhado) em TABELA --------
+        # ===== Desempenho =====
+        st.subheader("Desempenho")
+        perf_df = _performance_table(df, res)
+        st.dataframe(perf_df, use_container_width=True)
+
+        # ===== Análise de negociações =====
+        st.subheader("Análise de negociações")
+        analysis_df = _trades_analysis_table(df, res)
+        if analysis_df.empty:
+            st.info("Sem trades suficientes para análise.")
+        else:
+            st.dataframe(analysis_df, use_container_width=True)
+
+        # ===== Trades (detalhado) em TABELA =====
         st.subheader("Trades (detalhado)")
         trades_view = _build_trades_df(df, res, base_currency)
         if len(trades_view) == 0:
             st.info("Sem trades no período.")
         else:
-            # Configura formatação numérica (se sua versão do Streamlit suportar column_config)
             try:
                 st.dataframe(
                     trades_view,
@@ -374,13 +505,13 @@ if st.button("Rodar Simulação"):
                         "L&P acumulado (USD)": st.column_config.NumberColumn(format="%.2f"),
                         "L&P acumulado (%)": st.column_config.NumberColumn(format="%.2f%%"),
                         "Banca total (USD)": st.column_config.NumberColumn(format="%.2f"),
-
+                        "Banca total (%)": st.column_config.NumberColumn(format="%.2f%%"),
                     },
                 )
             except Exception:
-                # fallback: sem column_config (versões antigas do streamlit)
                 st.dataframe(trades_view, use_container_width=True)
 
+        # ===== Resumo do Capital =====
         st.subheader("Resumo do Capital")
         st.write(
             f"Moeda: {base_currency} | Inicial: {res['initial_bank']:.2f} | "
