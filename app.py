@@ -11,6 +11,21 @@ def _fmt_datetime_pt(ts) -> str:
     meses = ["jan.", "fev.", "mar.", "abr.", "mai.", "jun.", "jul.", "ago.", "set.", "out.", "nov.", "dez."]
     return f"{ts.day:02d} de {meses[ts.month-1]} de {ts.year}, {ts.hour:02d}:{ts.minute:02d}"
 
+def _fmt_usd_only(x: float) -> str:
+    return f"{x:,.2f} USD".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def _fmt_pct_only(p: float) -> str:
+    return f"{p*100:.2f}%".replace(".", ",")
+
+def _fmt_signed_usd(x: float) -> str:
+    s = _fmt_usd_only(abs(x))
+    return ("+" if x >= 0 else "-") + s
+
+def _fmt_signed_pct(p: float) -> str:
+    # p em base 0–1
+    s = f"{p*100:+.2f}%"
+    return s.replace(".", ",")
+
 # ========= Tabela de Trades (formato tabela, sem HTML) =========
 def _build_trades_df(df_price: pd.DataFrame, res: dict, base_currency="USD") -> pd.DataFrame:
     """
@@ -165,12 +180,6 @@ def _performance_table(df_price: pd.DataFrame, res: dict) -> pd.DataFrame:
     return pd.DataFrame.from_dict(linhas, orient="index", columns=["Todos", "Viés de alta", "Viés de baixa"])
 
 # ========= Análise de negociações =========
-def _fmt_usd_only(x: float) -> str:
-    return f"{x:,.2f} USD".replace(",", "X").replace(".", ",").replace("X", ".")
-
-def _fmt_pct_only(p: float) -> str:
-    return f"{p*100:.2f}%".replace(".", ",")
-
 def _cell_usd_pct(usd: float, pct: float) -> str:
     # duas linhas: USD na primeira, % na segunda
     return _fmt_usd_only(usd) + "\n" + _fmt_pct_only(pct)
@@ -511,9 +520,65 @@ if st.button("Rodar Simulação"):
             except Exception:
                 st.dataframe(trades_view, use_container_width=True)
 
-        # ===== Resumo do Capital =====
-        st.subheader("Resumo do Capital")
-        st.write(
-            f"Moeda: {base_currency} | Inicial: {res['initial_bank']:.2f} | "
-            f"Final: {res['final_bank']:.2f} | Resultado: {res['final_bank'] - res['initial_bank']:.2f}"
-        )
+        # ===== Visão geral =====
+        st.subheader("Visão geral")
+
+        # Séries de equity e valores básicos
+        eq = res["equity"].astype(float)
+        initial_bank = float(res["initial_bank"])
+        final_bank = float(res["final_bank"])
+        net_pnl = final_bank - initial_bank
+        net_pnl_pct = (final_bank / initial_bank - 1.0) if initial_bank > 0 else 0.0
+
+        # Máx. drawdown (USD e % relativo ao pico)
+        peak = eq.cummax()
+        dd_cash_series = peak - eq
+        max_dd_cash = float(dd_cash_series.max())
+        dd_pct_series = (eq / peak - 1.0).fillna(0.0)  # valores negativos
+        max_dd_pct = abs(float(dd_pct_series.min()))
+
+        # Estatísticas de trades
+        t = res.get("trades", pd.DataFrame())
+        closed = int(t["exit_time"].notna().sum()) if len(t) else 0
+        wins = int((t["pnl_cash"] > 0).sum()) if len(t) else 0
+        gross_profit = float(t.loc[t["pnl_cash"] > 0, "pnl_cash"].sum()) if len(t) else 0.0
+        gross_loss = float(-t.loc[t["pnl_cash"] < 0, "pnl_cash"].sum()) if len(t) else 0.0
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+
+        with c1:
+            st.metric(
+                label="L&P Total",
+                value=_fmt_signed_usd(net_pnl),
+                delta=_fmt_signed_pct(net_pnl_pct),
+                help="Lucro/prejuízo líquido do período em relação ao capital inicial."
+            )
+        with c2:
+            st.metric(
+                label="Máx. equity drawdown",
+                value=_fmt_usd_only(max_dd_cash),
+                delta=_fmt_signed_pct(-max_dd_pct),  # delta negativo
+                help="Maior queda a partir de um pico de equity até um fundo subsequente."
+            )
+        with c3:
+            st.metric(
+                label="Total de negociações",
+                value=str(closed),
+                help="Total de trades fechados (com saída)."
+            )
+        with c4:
+            win_rate = (wins / closed) if closed > 0 else 0.0
+            st.metric(
+                label="Negociações lucrativas",
+                value=_fmt_pct_only(win_rate),
+                help="Percentual de trades fechados com P&L positivo."
+            )
+            st.caption(f"{wins}/{closed}")
+        with c5:
+            pf_txt = "∞" if profit_factor == float('inf') else f"{profit_factor:.3f}".replace(".", ",")
+            st.metric(
+                label="Fator de lucro",
+                value=pf_txt,
+                help="A quantidade de dinheiro que a estratégia fez para cada unidade perdida — lucros brutos divididos por prejuízos brutos."
+            )
